@@ -14,55 +14,56 @@ This repository demonstrates how to co-host **`google/gemma-3-1b-it`** and **`Qw
 
 ```mermaid
 flowchart TB
-    Client["OpenAI API Client<br/>POST /v1/chat/completions<br/>{&quot;model&quot;: &quot;gemma3-critical&quot; | &quot;qwen-batch&quot; | ...}"]
+    Client["OpenAI API Client (POST /v1/chat/completions)"]
 
     subgraph GatewayNS["Namespace: cluster-inference-gateway"]
-        GW["GKE Regional Internal ALB Gateway<br/>(shared-inference-gateway / gke-l7-rilb)"]
-        IPP["LLM-D Payload Processor (IPP)<br/>(GCPRoutingExtension :9004)<br/>Extracts JSON 'model' -> X-Gateway-Base-Model-Name & X-Gateway-Model-Name"]
-        GW <-->|"1. FullDuplexStreamed ext_proc"| IPP
+        GW["GKE Regional Internal ALB Gateway (shared-inference-gateway)"]
+        IPP["LLM-D Payload Processor (GCPRoutingExtension :9004)"]
+        GW -->|"1. FullDuplexStreamed ext_proc"| IPP
+        IPP -.->|"Injects X-Gateway-Base-Model-Name and X-Gateway-Model-Name"| GW
     end
 
     Client -->|"HTTPS :443"| GW
 
     subgraph GemmaNS["Namespace: gemma-serving"]
-        GRoute["HTTPRoute: gemma3-http-route<br/>Injects x-gateway-inference-objective"]
-        GObj["InferenceObjectives<br/>gemma3-critical (100)<br/>gemma3-standard (10)<br/>gemma3-batch (-10)"]
+        GRoute["HTTPRoute: gemma3-http-route (Sets x-gateway-inference-objective)"]
+        GObj["InferenceObjectives: critical (100), standard (10), batch (-10)"]
         GPool["InferencePool: gemma3-inference-pool"]
-        GEPP["gemma3-epp-router (:9002)<br/>Queue + KV-Cache + Prefix Scorer"]
+        GEPP["gemma3-epp-router (:9002) Queue + KV-Cache + Prefix Scorer"]
         GRoute --> GPool
-        GObj -.->|"Policy"| GEPP
-        GPool <-->|"ext_proc"| GEPP
+        GObj -.->|"Priority Policy"| GEPP
+        GPool -->|"ext_proc"| GEPP
     end
 
     subgraph QwenNS["Namespace: qwen-serving"]
-        QRoute["HTTPRoute: qwen-http-route<br/>Injects x-gateway-inference-objective"]
-        QObj["InferenceObjectives<br/>qwen-critical (100)<br/>qwen-standard (10)<br/>qwen-batch (-10)"]
+        QRoute["HTTPRoute: qwen-http-route (Sets x-gateway-inference-objective)"]
+        QObj["InferenceObjectives: critical (100), standard (10), batch (-10)"]
         QPool["InferencePool: qwen-inference-pool"]
-        QEPP["qwen-epp-router (:9002)<br/>Queue + KV-Cache + Prefix Scorer"]
+        QEPP["qwen-epp-router (:9002) Queue + KV-Cache + Prefix Scorer"]
         QRoute --> QPool
-        QObj -.->|"Policy"| QEPP
-        QPool <-->|"ext_proc"| QEPP
+        QObj -.->|"Priority Policy"| QEPP
+        QPool -->|"ext_proc"| QEPP
     end
 
-    GW -->|"2a. X-Gateway-Base-Model-Name:<br/>google/gemma-3-1b-it"| GRoute
-    GW -->|"2b. X-Gateway-Base-Model-Name:<br/>Qwen/Qwen2.5-1.5B-Instruct"| QRoute
+    GW -->|"2a. Base Model: google/gemma-3-1b-it"| GRoute
+    GW -->|"2b. Base Model: Qwen/Qwen2.5-1.5B-Instruct"| QRoute
 
     subgraph SharedNode["Shared GKE GPU Node: g2-standard-8 (1x NVIDIA L4 24GB, time-sharing, max-clients=2)"]
-        GWorker["gemma3-worker (vLLM :8000)<br/>--gpu-memory-utilization=0.45 (~10.5 GiB)"]
-        QWorker["qwen-worker (vLLM :8000)<br/>--gpu-memory-utilization=0.45 (~10.5 GiB)"]
+        GWorker["gemma3-worker (vLLM :8000, gpu-memory-utilization=0.45)"]
+        QWorker["qwen-worker (vLLM :8000, gpu-memory-utilization=0.45)"]
     end
 
     GEPP -->|"3a. Endpoint Selection"| GWorker
     QEPP -->|"3b. Endpoint Selection"| QWorker
 
-    subgraph Autoscaling["Observability & KEDA Autoscaling"]
-        GMP["Google Cloud Managed Prometheus<br/>& gmp-proxy (:9090)"]
-        KEDA["KEDA ScaledObjects<br/>(Queue > 5 or Running > 16)"]
-        GEPP -.->|":9090/metrics"| GMP
-        QEPP -.->|":9090/metrics"| GMP
+    subgraph Autoscaling["Observability and KEDA Autoscaling"]
+        GMP["Google Cloud Managed Prometheus and gmp-proxy (:9090)"]
+        KEDA["KEDA ScaledObjects (Queue > 5 or Running > 16)"]
+        GEPP -.->|"Metrics :9090"| GMP
+        QEPP -.->|"Metrics :9090"| GMP
         GMP --> KEDA
-        KEDA -.->|"Scales 1..5"| GWorker
-        KEDA -.->|"Scales 1..5"| QWorker
+        KEDA -.->|"Scales 1 to 5 replicas"| GWorker
+        KEDA -.->|"Scales 1 to 5 replicas"| QWorker
     end
 ```
 
@@ -92,10 +93,10 @@ Clients always send standard OpenAI Chat Completions requests to `https://<GATEW
 | :--- | :--- | :--- | :---: | :--- |
 | `"gemma3-critical"` | `google/gemma-3-1b-it` | `gemma3-critical` | **`100`** | Highest priority; protected from load shedding. |
 | `"google/gemma-3-1b-it"` or `"gemma3-standard"` | `google/gemma-3-1b-it` | `gemma3-standard` | **`10`** | Default production tier; queued behind `critical`. |
-| `"gemma3-batch"` | `google/gemma-3-1b-it` | `gemma3-batch` | **`-10`** | **Sheddable (`< 0`):** Dropped (`HTTP 429`) when pool KV-cache saturates ($\ge 80\%$). |
+| `"gemma3-batch"` | `google/gemma-3-1b-it` | `gemma3-batch` | **`-10`** | **Sheddable (`< 0`):** Dropped (`HTTP 429`) when pool KV-cache saturates (`>= 80%`). |
 | `"qwen-critical"` | `Qwen/Qwen2.5-1.5B-Instruct` | `qwen-critical` | **`100`** | Highest priority; protected from load shedding. |
 | `"Qwen/Qwen2.5-1.5B-Instruct"` or `"qwen-standard"` | `Qwen/Qwen2.5-1.5B-Instruct` | `qwen-standard` | **`10`** | Default production tier; queued behind `critical`. |
-| `"qwen-batch"` | `Qwen/Qwen2.5-1.5B-Instruct` | `qwen-batch` | **`-10`** | **Sheddable (`< 0`):** Dropped (`HTTP 429`) when pool KV-cache saturates ($\ge 80\%$). |
+| `"qwen-batch"` | `Qwen/Qwen2.5-1.5B-Instruct` | `qwen-batch` | **`-10`** | **Sheddable (`< 0`):** Dropped (`HTTP 429`) when pool KV-cache saturates (`>= 80%`). |
 
 ---
 

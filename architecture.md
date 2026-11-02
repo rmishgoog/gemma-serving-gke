@@ -23,66 +23,67 @@ The design solves four core engineering challenges:
 flowchart TD
     subgraph VPC["Google Cloud VPC: gemma-serving-vpc (us-west1)"]
         subgraph Clients["Multi-Tenant Inference Clients"]
-            T1["Critical / Interactive Tenant<br/>model: gemma3-critical | qwen-critical"]
-            T2["Standard Tenant<br/>model: google/gemma-3-1b-it | Qwen/Qwen2.5-1.5B-Instruct"]
-            T3["Batch / Background Tenant<br/>model: gemma3-batch | qwen-batch"]
+            T1["Critical / Interactive Tenant (model: gemma3-critical or qwen-critical)"]
+            T2["Standard Tenant (model: google/gemma-3-1b-it or Qwen/Qwen2.5-1.5B-Instruct)"]
+            T3["Batch / Background Tenant (model: gemma3-batch or qwen-batch)"]
         end
 
-        subgraph IngressLayer["Shared Ingress & Payload Processing Layer (Namespace: cluster-inference-gateway)"]
-            Clients -->|HTTPS :443<br/>POST /v1/chat/completions| Gateway["Shared Gateway: shared-inference-gateway<br/>Class: gke-l7-rilb | IP: 10.10.0.9:443<br/>allowedRoutes.namespaces.from: All"]
-            Gateway <-->|GCPRoutingExtension<br/>FullDuplexStreamed gRPC :9004| IPP["Inference Payload Processor (IPP v0.1.0)<br/>1. body-field-to-header -> X-Gateway-Model-Name<br/>2. base-model-to-header -> X-Gateway-Base-Model-Name"]
+        subgraph IngressLayer["Shared Ingress and Payload Processing Layer (Namespace: cluster-inference-gateway)"]
+            Clients -->|"HTTPS :443 POST /v1/chat/completions"| Gateway["Shared Gateway: shared-inference-gateway (gke-l7-rilb, 10.10.0.9:443)"]
+            Gateway -->|"GCPRoutingExtension FullDuplexStreamed gRPC :9004"| IPP["Inference Payload Processor (IPP v0.1.0)"]
+            IPP -.->|"Sets X-Gateway-Model-Name and X-Gateway-Base-Model-Name"| Gateway
         end
 
         subgraph HostHardware["Shared Physical Host: G2 VM (g2-standard-8: 8 vCPU, 32 GiB RAM, 1x NVIDIA L4 24GB)"]
             subgraph TimeSharedGPU["Physical NVIDIA L4 GPU (24GB VRAM) - Time-Shared (2 Logical Slots)"]
-                GemmaSlice["Gemma 3 VRAM Allocation (45% ~10.8 GB)<br/>• Weights: ~2.5 GB<br/>• KV-Cache: ~8.3 GB"]
-                QwenSlice["Qwen 2.5 VRAM Allocation (45% ~10.8 GB)<br/>• Weights: ~3.1 GB<br/>• KV-Cache: ~7.7 GB"]
-                FreeBuffer["Safety & Driver Buffer (~2.4 GB / 10%)"]
+                GemmaSlice["Gemma 3 VRAM Allocation (45% ~10.8 GB: Weights ~2.5 GB, KV-Cache ~8.3 GB)"]
+                QwenSlice["Qwen 2.5 VRAM Allocation (45% ~10.8 GB: Weights ~3.1 GB, KV-Cache ~7.7 GB)"]
+                FreeBuffer["Safety and Driver Buffer (~2.4 GB / 10%)"]
             end
         end
 
         subgraph ObservabilityLayer["Centralized Observability Layer (Namespace: gmp-proxy)"]
-            GMPProxy["GMP Query Proxy: frontend.gmp-proxy.svc:9090<br/>Workload Identity: gmp-query-viewer-sa<br/>Role: roles/monitoring.viewer"]
-            CloudMon[("Google Cloud Monitoring<br/>Managed Prometheus Storage")]
-            GMPProxy <-->|Cloud Monitoring API| CloudMon
+            GMPProxy["GMP Query Proxy: frontend.gmp-proxy.svc:9090 (Workload Identity: gmp-query-viewer-sa)"]
+            CloudMon[("Google Cloud Monitoring (Managed Prometheus Storage)")]
+            GMPProxy -->|"Cloud Monitoring API"| CloudMon
         end
 
         subgraph GemmaNS["Model Namespace: gemma-serving"]
-            HTTPRouteGemma["HTTPRoute: gemma3-http-route<br/>Match: X-Gateway-Base-Model-Name == google/gemma-3-1b-it<br/>Injects: x-gateway-inference-objective"]
-            ObjGemma["InferenceObjectives (v1alpha2)<br/>• gemma3-critical (priority: 100)<br/>• gemma3-standard (priority: 10)<br/>• gemma3-batch (priority: -10)"]
-            InfPoolGemma["InferencePool: gemma3-inference-pool<br/>targetPort: 8000 | failureMode: FailOpen"]
-            EPPGemma["EPP Router: gemma3-epp-router<br/>Priority Queue + prefix-cache (3) | kv-util (2) | queue (1)"]
-            WorkerGemma["Pod: gemma3-worker<br/>vLLM: google/gemma-3-1b-it + tenant aliases<br/>gpu-memory-util: 0.45 | Req: 3 vCPU, 12Gi RAM, 1 GPU"]
-            KEDAGemma["KEDA ScaledObject: gemma3-keda-scaler<br/>Min: 1 (Warm Shared), Max: 5, Timeout: 10s"]
+            HTTPRouteGemma["HTTPRoute: gemma3-http-route (Injects x-gateway-inference-objective)"]
+            ObjGemma["InferenceObjectives: gemma3-critical (100), gemma3-standard (10), gemma3-batch (-10)"]
+            InfPoolGemma["InferencePool: gemma3-inference-pool (targetPort: 8000, FailOpen)"]
+            EPPGemma["EPP Router: gemma3-epp-router (prefix-cache, kv-util, queue scorer)"]
+            WorkerGemma["Pod: gemma3-worker (vLLM: google/gemma-3-1b-it, gpu-memory-util: 0.45)"]
+            KEDAGemma["KEDA ScaledObject: gemma3-keda-scaler (Min: 1, Max: 5, Timeout: 10s)"]
             
             HTTPRouteGemma --> InfPoolGemma
             ObjGemma -.-> EPPGemma
-            InfPoolGemma <-->|LbTrafficExtension :9002| EPPGemma
+            InfPoolGemma -->|"ext_proc :9002"| EPPGemma
             InfPoolGemma --> WorkerGemma
             KEDAGemma -.-> WorkerGemma
             WorkerGemma --- GemmaSlice
         end
 
         subgraph QwenNS["Model Namespace: qwen-serving"]
-            HTTPRouteQwen["HTTPRoute: qwen-http-route<br/>Match: X-Gateway-Base-Model-Name == Qwen/Qwen2.5-1.5B-Instruct<br/>Injects: x-gateway-inference-objective"]
-            ObjQwen["InferenceObjectives (v1alpha2)<br/>• qwen-critical (priority: 100)<br/>• qwen-standard (priority: 10)<br/>• qwen-batch (priority: -10)"]
-            InfPoolQwen["InferencePool: qwen-inference-pool<br/>targetPort: 8000 | failureMode: FailOpen"]
-            EPPQwen["EPP Router: qwen-epp-router<br/>Priority Queue + prefix-cache (3) | kv-util (2) | queue (1)"]
-            WorkerQwen["Pod: qwen-worker<br/>vLLM: Qwen/Qwen2.5-1.5B-Instruct + tenant aliases<br/>gpu-memory-util: 0.45 | Req: 3 vCPU, 12Gi RAM, 1 GPU"]
-            KEDAQwen["KEDA ScaledObject: qwen-keda-scaler<br/>Min: 1 (Warm Shared), Max: 5, Timeout: 10s"]
+            HTTPRouteQwen["HTTPRoute: qwen-http-route (Injects x-gateway-inference-objective)"]
+            ObjQwen["InferenceObjectives: qwen-critical (100), qwen-standard (10), qwen-batch (-10)"]
+            InfPoolQwen["InferencePool: qwen-inference-pool (targetPort: 8000, FailOpen)"]
+            EPPQwen["EPP Router: qwen-epp-router (prefix-cache, kv-util, queue scorer)"]
+            WorkerQwen["Pod: qwen-worker (vLLM: Qwen/Qwen2.5-1.5B-Instruct, gpu-memory-util: 0.45)"]
+            KEDAQwen["KEDA ScaledObject: qwen-keda-scaler (Min: 1, Max: 5, Timeout: 10s)"]
 
             HTTPRouteQwen --> InfPoolQwen
             ObjQwen -.-> EPPQwen
-            InfPoolQwen <-->|LbTrafficExtension :9002| EPPQwen
+            InfPoolQwen -->|"ext_proc :9002"| EPPQwen
             InfPoolQwen --> WorkerQwen
             KEDAQwen -.-> WorkerQwen
             WorkerQwen --- QwenSlice
         end
 
-        Gateway -->|Route to Gemma| HTTPRouteGemma
-        Gateway -->|Route to Qwen| HTTPRouteQwen
-        KEDAGemma -->|PromQL query| GMPProxy
-        KEDAQwen -->|PromQL query| GMPProxy
+        Gateway -->|"Route to Gemma"| HTTPRouteGemma
+        Gateway -->|"Route to Qwen"| HTTPRouteQwen
+        KEDAGemma -->|"PromQL query"| GMPProxy
+        KEDAQwen -->|"PromQL query"| GMPProxy
     end
 ```
 
@@ -96,7 +97,7 @@ flowchart TD
 - **Supported Strategy:** **GKE GPU Time-Sharing** (`cloud.google.com/gke-gpu-sharing-strategy: time-sharing`), verified and mutated automatically by GKE Autopilot's Warden admission webhook.
 
 ### 3.2 Time-Sharing Configuration
-Both `gemma3-worker` ([gemma-deployment.yaml](file:///home/rohitmishra/source/gemma-serving-gke/gemma-deployment.yaml)) and `qwen-worker` ([qwen-deployment.yaml](file:///home/rohitmishra/source/gemma-serving-gke/qwen-deployment.yaml)) configure identical time-sharing node selectors:
+Both `gemma3-worker` ([gemma-deployment.yaml](gemma-deployment.yaml)) and `qwen-worker` ([qwen-deployment.yaml](qwen-deployment.yaml)) configure identical time-sharing node selectors:
 
 ```yaml
 nodeSelector:
@@ -151,7 +152,7 @@ To guarantee that both pods schedule onto the **exact same physical host** acros
 ## 4. Ingress, Payload-Aware Multi-Model Routing & Multi-Tenant Priority Tiers
 
 ### 4.1 LLM-D Inference Payload Processor (IPP) & `GCPRoutingExtension`
-Deployed in `cluster-inference-gateway` ([gateway.yaml](file:///home/rohitmishra/source/gemma-serving-gke/gateway.yaml)), the **Inference Payload Processor (IPP)** (`ghcr.io/llm-d/llm-d-inference-payload-processor:v0.1.0`) is attached to `shared-inference-gateway` via a `GCPRoutingExtension` (`FullDuplexStreamed` over gRPC port `9004`, health-checked via `HealthCheckPolicy` on gRPC port `9005`):
+Deployed in `cluster-inference-gateway` ([gateway.yaml](gateway.yaml)), the **Inference Payload Processor (IPP)** (`ghcr.io/llm-d/llm-d-inference-payload-processor:v0.1.0`) is attached to `shared-inference-gateway` via a `GCPRoutingExtension` (`FullDuplexStreamed` over gRPC port `9004`, health-checked via `HealthCheckPolicy` on gRPC port `9005`):
 
 ```yaml
 apiVersion: llm-d.ai/v1alpha1
@@ -214,7 +215,7 @@ Because GKE Autopilot suppresses container-level `kubernetes.io/container/accele
 2. **vLLM Engine Telemetry (`gemma3-vllm-monitoring` & `qwen-vllm-monitoring`):** Scrapes `:8000/metrics` (`port: http`) every `15s` for per-model GPU KV-cache utilization (`vllm:gpu_cache_usage_factor`), running requests (`vllm:num_requests_running`), waiting queue (`vllm:num_requests_waiting`), and TTFT/TPOT latency histograms.
 
 ### 5.2 Warm Shared Baseline Autoscaling (`1 ↔ 5` Replicas)
-Both [gemma-keda-setup.yaml](file:///home/rohitmishra/source/gemma-serving-gke/gemma-keda-setup.yaml) (`gemma3-keda-scaler`) and [qwen-keda-setup.yaml](file:///home/rohitmishra/source/gemma-serving-gke/qwen-keda-setup.yaml) (`qwen-keda-scaler`) are configured with:
+Both [gemma-keda-setup.yaml](gemma-keda-setup.yaml) (`gemma3-keda-scaler`) and [qwen-keda-setup.yaml](qwen-keda-setup.yaml) (`qwen-keda-scaler`) are configured with:
 - **`minReplicaCount: 1` & `maxReplicaCount: 5`:** Keeps 1 warm replica of Gemma 3 and 1 warm replica of Qwen 2.5 co-located on a **single shared `g2-standard-8` node** at baseline (eliminating the 3–5 minute GKE Autopilot GPU cold-start deadlock), while scaling up horizontally (`1 -> 5`) under burst traffic.
 - **`timeout: "10s"` & `ignoreNullValues: "true"`:** Prevents `context canceled` timeouts when KEDA queries Google Cloud Monitoring via `http://frontend.gmp-proxy.svc:9090`.
 - **Triggers:**
