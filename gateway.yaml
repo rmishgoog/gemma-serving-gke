@@ -1,0 +1,207 @@
+# =============================================================
+# Shared Regional Internal Application Load Balancer Gateway
+# & LLM-D Inference Payload Processor (IPP) with GCPRoutingExtension
+# Namespace: cluster-inference-gateway
+# Class: gke-l7-rilb
+# =============================================================
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cluster-inference-gateway
+---
+# -------------------------------------------------------------
+# 1. GKE Regional Internal Gateway (ILB)
+# Caters to HTTPRoute resources from any namespace in the cluster
+# -------------------------------------------------------------
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: shared-inference-gateway
+  namespace: cluster-inference-gateway
+spec:
+  gatewayClassName: gke-l7-rilb
+  listeners:
+  - name: https
+    protocol: HTTPS
+    port: 443
+    tls:
+      mode: Terminate
+      certificateRefs:
+      - name: gemma-gateway-tls-cert
+        group: ""
+        kind: Secret
+    allowedRoutes:
+      namespaces:
+        from: All
+---
+# -------------------------------------------------------------
+# 2. LLM-D Inference Payload Processor (IPP) RBAC & Config
+# Watches ConfigMaps labeled inference.llm-d.ai/ipp-managed="true"
+# across all namespaces and extracts JSON "model" into headers:
+#   - X-Gateway-Model-Name (exact requested model or tenant alias)
+#   - X-Gateway-Base-Model-Name (resolved base model pool)
+# -------------------------------------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: payload-processor
+  namespace: cluster-inference-gateway
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: payload-processor-configmap-reader
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: payload-processor-configmap-reader
+subjects:
+- kind: ServiceAccount
+  name: payload-processor
+  namespace: cluster-inference-gateway
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: payload-processor-configmap-reader
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: payload-processor
+  namespace: cluster-inference-gateway
+data:
+  default-ipp-config.yaml: |
+    apiVersion: llm-d.ai/v1alpha1
+    kind: PayloadProcessorConfig
+    plugins:
+    - type: body-field-to-header
+      parameters:
+        fieldName: model
+        headerName: X-Gateway-Model-Name
+    - type: base-model-to-header
+    profiles:
+    - name: default
+      plugins:
+        request:
+        - pluginRef: body-field-to-header
+        - pluginRef: base-model-to-header
+---
+# -------------------------------------------------------------
+# 3. LLM-D Inference Payload Processor Deployment & Service
+# -------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: payload-processor
+  namespace: cluster-inference-gateway
+spec:
+  selector:
+    app: payload-processor
+  ports:
+  - name: grpc-ext-proc
+    protocol: TCP
+    port: 9004
+    targetPort: 9004
+    appProtocol: HTTP2
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payload-processor
+  namespace: cluster-inference-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: payload-processor
+  template:
+    metadata:
+      labels:
+        app: payload-processor
+    spec:
+      serviceAccountName: payload-processor
+      containers:
+      - name: payload-processor
+        image: ghcr.io/llm-d/llm-d-inference-payload-processor:v0.1.0
+        imagePullPolicy: IfNotPresent
+        args:
+        - --config-file
+        - "/config/default-ipp-config.yaml"
+        - --v=3
+        - --tracing=false
+        ports:
+        - containerPort: 9004
+          name: grpc
+        - containerPort: 9005
+          name: health
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        volumeMounts:
+        - name: config-volume
+          mountPath: "/config"
+      volumes:
+      - name: config-volume
+        configMap:
+          name: payload-processor
+---
+# -------------------------------------------------------------
+# 4. GKE HealthCheckPolicy & GCPRoutingExtension for IPP
+# -------------------------------------------------------------
+apiVersion: networking.gke.io/v1
+kind: HealthCheckPolicy
+metadata:
+  name: payload-processor-healthcheck
+  namespace: cluster-inference-gateway
+spec:
+  default:
+    logConfig:
+      enabled: true
+    config:
+      type: "GRPC"
+      grpcHealthCheck:
+        portSpecification: "USE_FIXED_PORT"
+        port: 9005
+  targetRef:
+    group: ""
+    kind: Service
+    name: payload-processor
+    namespace: cluster-inference-gateway
+---
+apiVersion: networking.gke.io/v1
+kind: GCPRoutingExtension
+metadata:
+  name: payload-processor
+  namespace: cluster-inference-gateway
+spec:
+  targetRefs:
+  - group: "gateway.networking.k8s.io"
+    kind: Gateway
+    name: shared-inference-gateway
+  extensionChains:
+  - name: chain1
+    extensions:
+    - name: ext1
+      authority: "myext.com"
+      timeout: 1s
+      supportedEvents:
+      - RequestHeaders
+      - RequestBody
+      - RequestTrailers
+      requestBodySendMode: "FullDuplexStreamed"
+      backendRef:
+        group: ""
+        kind: Service
+        name: payload-processor
+        port: 9004

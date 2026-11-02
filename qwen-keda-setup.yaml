@@ -1,0 +1,55 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: qwen-keda-scaler
+  namespace: qwen-serving
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: qwen-worker
+  minReplicaCount: 1
+  maxReplicaCount: 5
+  pollingInterval: 15
+  cooldownPeriod: 300
+  advanced:
+    horizontalPodAutoscalerConfig:
+      name: keda-hpa-qwen-worker
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+          - type: Pods
+            value: 2
+            periodSeconds: 30
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+          - type: Percent
+            value: 50
+            periodSeconds: 60
+  triggers:
+  # -------------------------------------------------------------
+  # Trigger 1: EPP Flow Control Queue Size (Burst Trigger)
+  # -------------------------------------------------------------
+  - type: prometheus
+    metadata:
+      serverAddress: http://frontend.gmp-proxy.svc:9090
+      metricName: llm_d_epp_flow_control_queue_size
+      query: (sum(llm_d_epp_flow_control_queue_size{namespace="qwen-serving"})) or vector(0)
+      threshold: "5"
+      activationThreshold: "1"
+      timeout: "10s"
+      ignoreNullValues: "true"
+  # -------------------------------------------------------------
+  # Trigger 2: Active Concurrent Inference Streams
+  # -------------------------------------------------------------
+  - type: prometheus
+    metadata:
+      serverAddress: http://frontend.gmp-proxy.svc:9090
+      metricName: llm_d_epp_request_running
+      query: (sum(llm_d_epp_request_running{namespace="qwen-serving"})) or vector(0)
+      threshold: "16"
+      activationThreshold: "1"
+      timeout: "10s"
+      ignoreNullValues: "true"

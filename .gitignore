@@ -1,0 +1,27 @@
+# Credentials, TLS certificates, and environment secrets
+*.key
+*.crt
+*.pem
+*.p12
+*.pfx
+.env
+.env.*
+*kubeconfig*
+*credentials*.json
+*service-account*.json
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Local notes / excluded files
+backlog.md
+
+# Temporary logs and scratch outputs
+*.log
+/tmp/

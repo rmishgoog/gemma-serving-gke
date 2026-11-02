@@ -1,0 +1,477 @@
+# -------------------------------------------------------------
+# 0. IPP Model Mapping ConfigMap (Used by Payload Processor)
+# Maps base model and multi-tenant priority aliases to google/gemma-3-1b-it
+# -------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gemma3-model-mapping
+  namespace: gemma-serving
+  labels:
+    inference.llm-d.ai/ipp-managed: "true"
+data:
+  baseModel: "google/gemma-3-1b-it"
+  adapters: |
+    - gemma3-critical
+    - gemma3-standard
+    - gemma3-batch
+---
+# -------------------------------------------------------------
+# 1. LLM-D Endpoint Picker (EPP) Scheduler / Router
+# -------------------------------------------------------------
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: gemma3-epp-config
+  namespace: gemma-serving
+data:
+  config.yaml: |
+    apiVersion: inference.networking.x-k8s.io/v1alpha1
+    kind: EndpointPickerConfig
+    plugins:
+      - type: queue-scorer
+      - type: kv-cache-utilization-scorer
+      - type: prefix-cache-scorer
+      - type: max-score-picker
+      - type: single-profile-handler
+    schedulingProfiles:
+      - name: default
+        plugins:
+          - pluginRef: queue-scorer
+            weight: 1
+          - pluginRef: kv-cache-utilization-scorer
+            weight: 2
+          - pluginRef: prefix-cache-scorer
+            weight: 3
+          - pluginRef: max-score-picker
+          - pluginRef: single-profile-handler
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gemma3-epp-sa
+  namespace: gemma-serving
+---
+# 1. Permission to watch InferencePools & Extension resources
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gemma3-epp-role
+rules:
+- apiGroups:
+  - inference.networking.k8s.io
+  - inference.networking.x-k8s.io
+  resources:
+  - inferencepools
+  - inferencepools/status
+  - inferenceobjectives
+  - inferenceobjectives/status
+  - inferencemodels
+  verbs:
+  - get
+  - list
+  - watch
+# 2. Permission to watch Pods and Endpoints/EndpointSlices for routing
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  - services
+  - endpoints
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - discovery.k8s.io
+  resources:
+  - endpointslices
+  verbs:
+  - get
+  - list
+  - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gemma3-epp-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: gemma3-epp-role
+subjects:
+- kind: ServiceAccount
+  name: gemma3-epp-sa
+  namespace: gemma-serving
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gemma3-epp-router
+  namespace: gemma-serving
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gemma3-epp-router
+  template:
+    metadata:
+      labels:
+        app: gemma3-epp-router
+    spec:
+      serviceAccount: gemma3-epp-sa
+      automountServiceAccountToken: true
+      volumes:
+      - name: config-volume
+        configMap:
+          name: gemma3-epp-config
+      containers:
+      - name: epp
+        image: registry.k8s.io/gateway-api-inference-extension/epp:v1.0.1
+        args:
+        - "--pool-name=gemma3-inference-pool"
+        - "--pool-namespace=gemma-serving"
+        - "--grpc-port=9002"
+        - "--zap-encoder=json"
+        - "--metrics-port=9090"
+        - "--config-file=/etc/epp/config.yaml"
+        ports:
+        - containerPort: 9002
+          name: grpc-epp
+        volumeMounts:
+        - name: config-volume
+          mountPath: /etc/epp
+          readOnly: true
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+          limits:
+            cpu: "1"
+            memory: "1Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gemma3-epp-service
+  namespace: gemma-serving
+spec:
+  type: ClusterIP
+  selector:
+    app: gemma3-epp-router
+  ports:
+  - port: 9002
+    targetPort: 9002
+    name: grpc-epp
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gemma3-epp-metrics
+  namespace: gemma-serving
+  labels:
+    app: gemma3-epp-router
+spec:
+  type: ClusterIP
+  selector:
+    app: gemma3-epp-router
+  ports:
+  - name: metrics
+    port: 9090
+    targetPort: 9090
+---
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: gemma3-epp-monitoring
+  namespace: gemma-serving
+spec:
+  selector:
+    matchLabels:
+      app: gemma3-epp-router
+  endpoints:
+  - port: metrics
+    path: /metrics
+    interval: 10s
+---
+# -------------------------------------------------------------
+# 2. Gemma 3 Model Server Pods (vLLM on Time-Shared NVIDIA L4 GPUs)
+# -------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gemma3-worker
+  namespace: gemma-serving
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gemma3-worker
+  template:
+    metadata:
+      labels:
+        app: gemma3-worker
+    spec:
+      nodeSelector:
+        cloud.google.com/gke-accelerator: nvidia-l4
+        cloud.google.com/gke-gpu-driver-version: default
+        cloud.google.com/gke-gpu-sharing-strategy: time-sharing
+        cloud.google.com/gke-max-shared-clients-per-gpu: "2"
+      affinity:
+        podAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              namespaces:
+              - gemma-serving
+              - qwen-serving
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values: ["gemma3-worker", "qwen-worker"]
+              topologyKey: "kubernetes.io/hostname"
+      tolerations:
+      - key: "cloud.google.com/gke-accelerator"
+        operator: "Equal"
+        value: "nvidia-l4"
+        effect: "NoSchedule"
+      containers:
+      - name: vllm-engine
+        image: vllm/vllm-openai:latest
+        args:
+        - "--model=google/gemma-3-1b-it"
+        - "--served-model-name"
+        - "google/gemma-3-1b-it"
+        - "gemma3-critical"
+        - "gemma3-standard"
+        - "gemma3-batch"
+        - "--port=8000"
+        - "--gpu-memory-utilization=0.45"
+        - "--max-model-len=8192"
+        - "--dtype=bfloat16"
+        - "--enable-prefix-caching"
+        - "--trust-remote-code"
+        env:
+        - name: HUGGING_FACE_HUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-secret
+              key: hf_token
+        - name: HF_HUB_ENABLE_HF_TRANSFER
+          value: "1"
+        ports:
+        - containerPort: 8000
+          name: http
+        resources:
+          limits:
+            nvidia.com/gpu: "1"
+            cpu: "3"
+            memory: "12Gi"
+            ephemeral-storage: "30Gi"
+          requests:
+            nvidia.com/gpu: "1"
+            cpu: "3"
+            memory: "12Gi"
+            ephemeral-storage: "30Gi"
+        volumeMounts:
+        - mountPath: /dev/shm
+          name: dshm
+      volumes:
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 3Gi
+---
+# -------------------------------------------------------------
+# 2b. Direct vLLM Engine PodMonitoring (Per-Model GPU KV Cache Metrics)
+# -------------------------------------------------------------
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: gemma3-vllm-monitoring
+  namespace: gemma-serving
+spec:
+  selector:
+    matchLabels:
+      app: gemma3-worker
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: 15s
+---
+# -------------------------------------------------------------
+# 3. Gateway API InferencePool Custom Resource & HealthCheckPolicy
+# -------------------------------------------------------------
+apiVersion: inference.networking.k8s.io/v1
+kind: InferencePool
+metadata:
+  name: gemma3-inference-pool
+  namespace: gemma-serving
+spec:
+  selector:
+    matchLabels:
+      app: gemma3-worker
+  targetPorts:
+  - number: 8000
+  endpointPickerRef:
+    name: gemma3-epp-service
+    port:
+      number: 9002
+    failureMode: FailOpen
+---
+apiVersion: networking.gke.io/v1
+kind: HealthCheckPolicy
+metadata:
+  name: gemma3-pool-healthcheck
+  namespace: gemma-serving
+spec:
+  default:
+    checkIntervalSec: 10
+    timeoutSec: 5
+    healthyThreshold: 1
+    unhealthyThreshold: 2
+    config:
+      type: HTTP
+      httpHealthCheck:
+        portSpecification: USE_SERVING_PORT
+        requestPath: /health
+  targetRef:
+    group: "inference.networking.k8s.io"
+    kind: InferencePool
+    name: gemma3-inference-pool
+---
+# -------------------------------------------------------------
+# 3b. Multi-Tenant InferenceObjectives (Priority Tiers)
+# -------------------------------------------------------------
+apiVersion: inference.networking.x-k8s.io/v1alpha2
+kind: InferenceObjective
+metadata:
+  name: gemma3-critical
+  namespace: gemma-serving
+spec:
+  priority: 100
+  poolRef:
+    group: inference.networking.k8s.io
+    kind: InferencePool
+    name: gemma3-inference-pool
+---
+apiVersion: inference.networking.x-k8s.io/v1alpha2
+kind: InferenceObjective
+metadata:
+  name: gemma3-standard
+  namespace: gemma-serving
+spec:
+  priority: 10
+  poolRef:
+    group: inference.networking.k8s.io
+    kind: InferencePool
+    name: gemma3-inference-pool
+---
+apiVersion: inference.networking.x-k8s.io/v1alpha2
+kind: InferenceObjective
+metadata:
+  name: gemma3-batch
+  namespace: gemma-serving
+spec:
+  priority: -10
+  poolRef:
+    group: inference.networking.k8s.io
+    kind: InferencePool
+    name: gemma3-inference-pool
+---
+# -------------------------------------------------------------
+# 4. ReferenceGrant (Authorizes Gateway -> Backend in gemma-serving)
+# -------------------------------------------------------------
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-shared-gateway-to-inference-pool
+  namespace: gemma-serving
+spec:
+  from:
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    namespace: cluster-inference-gateway
+  to:
+  - group: inference.networking.k8s.io
+    kind: InferencePool
+---
+# -------------------------------------------------------------
+# 5. Multi-Tenant HTTPRoute Targeting the InferencePool
+# Maps tenant model aliases to x-gateway-inference-objective priorities
+# -------------------------------------------------------------
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: gemma3-http-route
+  namespace: gemma-serving
+spec:
+  parentRefs:
+  - name: shared-inference-gateway
+    namespace: cluster-inference-gateway
+    sectionName: https
+  rules:
+  - matches:
+    - headers:
+      - name: X-Gateway-Base-Model-Name
+        value: google/gemma-3-1b-it
+      - name: X-Gateway-Model-Name
+        value: gemma3-critical
+    filters:
+    - type: RequestHeaderModifier
+      requestHeaderModifier:
+        set:
+        - name: x-gateway-inference-objective
+          value: gemma3-critical
+    backendRefs:
+    - group: inference.networking.k8s.io
+      kind: InferencePool
+      name: gemma3-inference-pool
+  - matches:
+    - headers:
+      - name: X-Gateway-Base-Model-Name
+        value: google/gemma-3-1b-it
+      - name: X-Gateway-Model-Name
+        value: gemma3-batch
+    filters:
+    - type: RequestHeaderModifier
+      requestHeaderModifier:
+        set:
+        - name: x-gateway-inference-objective
+          value: gemma3-batch
+    backendRefs:
+    - group: inference.networking.k8s.io
+      kind: InferencePool
+      name: gemma3-inference-pool
+  - matches:
+    - headers:
+      - name: X-Gateway-Base-Model-Name
+        value: google/gemma-3-1b-it
+    filters:
+    - type: RequestHeaderModifier
+      requestHeaderModifier:
+        add:
+        - name: x-gateway-inference-objective
+          value: gemma3-standard
+    backendRefs:
+    - group: inference.networking.k8s.io
+      kind: InferencePool
+      name: gemma3-inference-pool
+---
+#-------------------------------------------------------------------
+# 6. A ClusterIP service for localized kubectl port-forward testing
+#-------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: gemma3-service
+  namespace: gemma-serving
+spec:
+  type: ClusterIP
+  selector:
+    app: gemma3-worker
+  ports:
+  - port: 8000
+    targetPort: 8000
+    name: http

@@ -1,0 +1,448 @@
+# =============================================================
+# Qwen 2.5 1.5B Serving Manifest on GKE Autopilot (LLM-D & KEDA)
+# Namespace: qwen-serving
+# GPU Architecture: Time-shared NVIDIA L4 (Co-located with Gemma 3)
+# =============================================================
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: qwen-serving
+---
+# -------------------------------------------------------------
+# 1. IPP Model Mapping ConfigMap (Used by Payload Processor)
+# Maps base model and multi-tenant priority aliases to Qwen/Qwen2.5-1.5B-Instruct
+# -------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: qwen-model-mapping
+  namespace: qwen-serving
+  labels:
+    inference.llm-d.ai/ipp-managed: "true"
+data:
+  baseModel: "Qwen/Qwen2.5-1.5B-Instruct"
+  adapters: |
+    - qwen-critical
+    - qwen-standard
+    - qwen-batch
+---
+# -------------------------------------------------------------
+# 2. LLM-D Endpoint Picker (EPP) Scheduler / Router Configuration
+# -------------------------------------------------------------
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: qwen-epp-config
+  namespace: qwen-serving
+data:
+  config.yaml: |
+    apiVersion: inference.networking.x-k8s.io/v1alpha1
+    kind: EndpointPickerConfig
+    plugins:
+      - type: queue-scorer
+      - type: kv-cache-utilization-scorer
+      - type: prefix-cache-scorer
+      - type: max-score-picker
+      - type: single-profile-handler
+    schedulingProfiles:
+      - name: default
+        plugins:
+          - pluginRef: queue-scorer
+            weight: 1
+          - pluginRef: kv-cache-utilization-scorer
+            weight: 2
+          - pluginRef: prefix-cache-scorer
+            weight: 3
+          - pluginRef: max-score-picker
+          - pluginRef: single-profile-handler
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: qwen-epp-sa
+  namespace: qwen-serving
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: qwen-epp-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: gemma3-epp-role
+subjects:
+- kind: ServiceAccount
+  name: qwen-epp-sa
+  namespace: qwen-serving
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qwen-epp-router
+  namespace: qwen-serving
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: qwen-epp-router
+  template:
+    metadata:
+      labels:
+        app: qwen-epp-router
+    spec:
+      serviceAccount: qwen-epp-sa
+      automountServiceAccountToken: true
+      volumes:
+      - name: config-volume
+        configMap:
+          name: qwen-epp-config
+      containers:
+      - name: epp
+        image: registry.k8s.io/gateway-api-inference-extension/epp:v1.0.1
+        args:
+        - "--pool-name=qwen-inference-pool"
+        - "--pool-namespace=qwen-serving"
+        - "--grpc-port=9002"
+        - "--zap-encoder=json"
+        - "--metrics-port=9090"
+        - "--config-file=/etc/epp/config.yaml"
+        ports:
+        - containerPort: 9002
+          name: grpc-epp
+        volumeMounts:
+        - name: config-volume
+          mountPath: /etc/epp
+          readOnly: true
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+          limits:
+            cpu: "1"
+            memory: "1Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: qwen-epp-service
+  namespace: qwen-serving
+spec:
+  type: ClusterIP
+  selector:
+    app: qwen-epp-router
+  ports:
+  - port: 9002
+    targetPort: 9002
+    name: grpc-epp
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: qwen-epp-metrics
+  namespace: qwen-serving
+  labels:
+    app: qwen-epp-router
+spec:
+  type: ClusterIP
+  selector:
+    app: qwen-epp-router
+  ports:
+  - name: metrics
+    port: 9090
+    targetPort: 9090
+---
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: qwen-epp-monitoring
+  namespace: qwen-serving
+spec:
+  selector:
+    matchLabels:
+      app: qwen-epp-router
+  endpoints:
+  - port: metrics
+    path: /metrics
+    interval: 10s
+---
+# -------------------------------------------------------------
+# 3. Qwen 2.5 1.5B Model Server Pods (vLLM on Time-Shared NVIDIA L4)
+# -------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qwen-worker
+  namespace: qwen-serving
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: qwen-worker
+  template:
+    metadata:
+      labels:
+        app: qwen-worker
+    spec:
+      nodeSelector:
+        cloud.google.com/gke-accelerator: nvidia-l4
+        cloud.google.com/gke-gpu-driver-version: default
+        cloud.google.com/gke-gpu-sharing-strategy: time-sharing
+        cloud.google.com/gke-max-shared-clients-per-gpu: "2"
+      affinity:
+        podAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              namespaces:
+              - gemma-serving
+              - qwen-serving
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values: ["gemma3-worker", "qwen-worker"]
+              topologyKey: "kubernetes.io/hostname"
+      tolerations:
+      - key: "cloud.google.com/gke-accelerator"
+        operator: "Equal"
+        value: "nvidia-l4"
+        effect: "NoSchedule"
+      containers:
+      - name: vllm-engine
+        image: vllm/vllm-openai:latest
+        args:
+        - "--model=Qwen/Qwen2.5-1.5B-Instruct"
+        - "--served-model-name"
+        - "Qwen/Qwen2.5-1.5B-Instruct"
+        - "qwen-critical"
+        - "qwen-standard"
+        - "qwen-batch"
+        - "--port=8000"
+        - "--gpu-memory-utilization=0.45"
+        - "--max-model-len=8192"
+        - "--dtype=bfloat16"
+        - "--enable-prefix-caching"
+        env:
+        - name: HUGGING_FACE_HUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-secret
+              key: hf_token
+        - name: HF_HUB_ENABLE_HF_TRANSFER
+          value: "1"
+        ports:
+        - containerPort: 8000
+          name: http
+        resources:
+          limits:
+            nvidia.com/gpu: "1"
+            cpu: "3"
+            memory: "12Gi"
+            ephemeral-storage: "30Gi"
+          requests:
+            nvidia.com/gpu: "1"
+            cpu: "3"
+            memory: "12Gi"
+            ephemeral-storage: "30Gi"
+        volumeMounts:
+        - mountPath: /dev/shm
+          name: dshm
+      volumes:
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 3Gi
+---
+# -------------------------------------------------------------
+# 3b. Direct vLLM Engine PodMonitoring (Per-Model GPU KV Cache Metrics)
+# -------------------------------------------------------------
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: qwen-vllm-monitoring
+  namespace: qwen-serving
+spec:
+  selector:
+    matchLabels:
+      app: qwen-worker
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: 15s
+---
+# -------------------------------------------------------------
+# 4. Gateway API InferencePool Custom Resource & HealthCheckPolicy
+# -------------------------------------------------------------
+apiVersion: inference.networking.k8s.io/v1
+kind: InferencePool
+metadata:
+  name: qwen-inference-pool
+  namespace: qwen-serving
+spec:
+  selector:
+    matchLabels:
+      app: qwen-worker
+  targetPorts:
+  - number: 8000
+  endpointPickerRef:
+    name: qwen-epp-service
+    port:
+      number: 9002
+    failureMode: FailOpen
+---
+apiVersion: networking.gke.io/v1
+kind: HealthCheckPolicy
+metadata:
+  name: qwen-pool-healthcheck
+  namespace: qwen-serving
+spec:
+  default:
+    checkIntervalSec: 10
+    timeoutSec: 5
+    healthyThreshold: 1
+    unhealthyThreshold: 2
+    config:
+      type: HTTP
+      httpHealthCheck:
+        portSpecification: USE_SERVING_PORT
+        requestPath: /health
+  targetRef:
+    group: "inference.networking.k8s.io"
+    kind: InferencePool
+    name: qwen-inference-pool
+---
+# -------------------------------------------------------------
+# 4b. Multi-Tenant InferenceObjectives (Priority Tiers)
+# -------------------------------------------------------------
+apiVersion: inference.networking.x-k8s.io/v1alpha2
+kind: InferenceObjective
+metadata:
+  name: qwen-critical
+  namespace: qwen-serving
+spec:
+  priority: 100
+  poolRef:
+    group: inference.networking.k8s.io
+    kind: InferencePool
+    name: qwen-inference-pool
+---
+apiVersion: inference.networking.x-k8s.io/v1alpha2
+kind: InferenceObjective
+metadata:
+  name: qwen-standard
+  namespace: qwen-serving
+spec:
+  priority: 10
+  poolRef:
+    group: inference.networking.k8s.io
+    kind: InferencePool
+    name: qwen-inference-pool
+---
+apiVersion: inference.networking.x-k8s.io/v1alpha2
+kind: InferenceObjective
+metadata:
+  name: qwen-batch
+  namespace: qwen-serving
+spec:
+  priority: -10
+  poolRef:
+    group: inference.networking.k8s.io
+    kind: InferencePool
+    name: qwen-inference-pool
+---
+# -------------------------------------------------------------
+# 5. ReferenceGrant (Authorizes Shared Gateway -> Qwen InferencePool)
+# -------------------------------------------------------------
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-shared-gateway-to-qwen-inference-pool
+  namespace: qwen-serving
+spec:
+  from:
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    namespace: cluster-inference-gateway
+  to:
+  - group: inference.networking.k8s.io
+    kind: InferencePool
+---
+# -------------------------------------------------------------
+# 6. Multi-Tenant HTTPRoute Targeting Qwen InferencePool
+# Maps tenant model aliases to x-gateway-inference-objective priorities
+# -------------------------------------------------------------
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: qwen-http-route
+  namespace: qwen-serving
+spec:
+  parentRefs:
+  - name: shared-inference-gateway
+    namespace: cluster-inference-gateway
+    sectionName: https
+  rules:
+  - matches:
+    - headers:
+      - name: X-Gateway-Base-Model-Name
+        value: Qwen/Qwen2.5-1.5B-Instruct
+      - name: X-Gateway-Model-Name
+        value: qwen-critical
+    filters:
+    - type: RequestHeaderModifier
+      requestHeaderModifier:
+        set:
+        - name: x-gateway-inference-objective
+          value: qwen-critical
+    backendRefs:
+    - group: inference.networking.k8s.io
+      kind: InferencePool
+      name: qwen-inference-pool
+  - matches:
+    - headers:
+      - name: X-Gateway-Base-Model-Name
+        value: Qwen/Qwen2.5-1.5B-Instruct
+      - name: X-Gateway-Model-Name
+        value: qwen-batch
+    filters:
+    - type: RequestHeaderModifier
+      requestHeaderModifier:
+        set:
+        - name: x-gateway-inference-objective
+          value: qwen-batch
+    backendRefs:
+    - group: inference.networking.k8s.io
+      kind: InferencePool
+      name: qwen-inference-pool
+  - matches:
+    - headers:
+      - name: X-Gateway-Base-Model-Name
+        value: Qwen/Qwen2.5-1.5B-Instruct
+    filters:
+    - type: RequestHeaderModifier
+      requestHeaderModifier:
+        add:
+        - name: x-gateway-inference-objective
+          value: qwen-standard
+    backendRefs:
+    - group: inference.networking.k8s.io
+      kind: InferencePool
+      name: qwen-inference-pool
+---
+# -------------------------------------------------------------
+# 7. ClusterIP Service for Direct In-Cluster / Port-Forward Testing
+# -------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: qwen-service
+  namespace: qwen-serving
+spec:
+  type: ClusterIP
+  selector:
+    app: qwen-worker
+  ports:
+  - port: 8000
+    targetPort: 8000
+    name: http

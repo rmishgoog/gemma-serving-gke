@@ -1,0 +1,82 @@
+# =============================================================
+# Google Cloud Managed Service for Prometheus (GMP) Query Proxy
+# Namespace: gmp-proxy
+# Purpose: Translates PromQL queries from KEDA into Google Cloud
+#          Monitoring API requests using Workload Identity.
+# =============================================================
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gmp-proxy
+---
+# -------------------------------------------------------------
+# Kubernetes ServiceAccount mapped to Google IAM Service Account
+# -------------------------------------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gmp-frontend-ksa
+  namespace: gmp-proxy
+  annotations:
+    iam.gke.io/gcp-service-account: gmp-query-viewer-sa@YOUR_GCP_PROJECT_ID.iam.gserviceaccount.com
+---
+# -------------------------------------------------------------
+# GMP Frontend Proxy Deployment
+# -------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gmp-proxy
+  namespace: gmp-proxy
+  labels:
+    app.kubernetes.io/name: gmp-proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gmp-proxy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gmp-proxy
+    spec:
+      serviceAccount: gmp-frontend-ksa
+      automountServiceAccountToken: true
+      containers:
+      - name: gmp-proxy
+        image: gke.gcr.io/prometheus-engine/frontend:v0.15.3-gke.0
+        args:
+        - "--web.listen-address=:9090"
+        - "--query.project-id=YOUR_GCP_PROJECT_ID"
+        ports:
+        - name: web
+          containerPort: 9090
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+---
+# -------------------------------------------------------------
+# Frontend Service for In-Cluster PromQL Querying (Port 9090)
+# Accessible across all namespaces as:
+# http://frontend.gmp-proxy.svc:9090
+# -------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: gmp-proxy
+  labels:
+    app.kubernetes.io/name: gmp-proxy
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: gmp-proxy
+  ports:
+  - name: web
+    port: 9090
+    targetPort: 9090
